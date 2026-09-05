@@ -1,3 +1,4 @@
+import os
 import discord
 from discord.ext import commands
 import random
@@ -1162,4 +1163,4 @@ async def on_command_error(ctx, error):
 # 🚀 CHẠY BOT
 # =========================
 
-bot.run("MTU0NTI3MzMwMzE1MTY3NzQ2Mg.GOF5tI.QbvEwDVhd9kDRYKyptfvLfh_tjBovxXpKy3dzk")
+bot.run(os.getenv("DISCORD_TOKEN"))
