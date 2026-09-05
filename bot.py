@@ -1162,5 +1162,4 @@ async def on_command_error(ctx, error):
 # =========================
 # 🚀 CHẠY BOT
 # =========================
-
 bot.run(os.getenv("DISCORD_TOKEN"))
