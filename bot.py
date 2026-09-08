@@ -1,9 +1,8 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import threading
 import os
 import json
 import time
-import asyncio
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
@@ -19,7 +18,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
@@ -34,11 +32,11 @@ bot = commands.Bot(
 ANTI_NUKE_FILE = "antinuke.json"
 
 
-def load_antinu​​ke():
+def load_antinuke():
     try:
         with open(ANTI_NUKE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
@@ -47,7 +45,7 @@ def save_antinuke(data):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 
-antinuke_data = load_antinu​​ke()
+antinuke_data = load_antinuke()
 
 
 # =========================
@@ -91,12 +89,14 @@ def get_settings(guild_id):
 
 def admin_only():
     async def predicate(ctx):
+        if ctx.guild is None:
+            await ctx.send("❌ Lệnh này chỉ dùng được trong server.")
+            return False
+
         if ctx.author.guild_permissions.administrator:
             return True
 
-        await ctx.send(
-            "❌ Chỉ **Admin** mới có thể sử dụng lệnh này."
-        )
+        await ctx.send("❌ Chỉ **Admin** mới có thể sử dụng lệnh này.")
         return False
 
     return commands.check(predicate)
@@ -108,7 +108,6 @@ def admin_only():
 
 async def antinuke_log(guild, message):
     settings = get_settings(guild.id)
-
     channel_id = settings.get("log_channel")
 
     if not channel_id:
@@ -126,7 +125,6 @@ async def antinuke_log(guild, message):
             color=discord.Color.red(),
             timestamp=datetime.utcnow()
         )
-
         await channel.send(embed=embed)
 
     except Exception as e:
@@ -134,7 +132,7 @@ async def antinuke_log(guild, message):
 
 
 # =========================
-# PUNISH NUKER
+# BAN NGƯỜI PHÁ SERVER
 # =========================
 
 async def punish_nuker(guild, member, reason):
@@ -179,9 +177,7 @@ async def record_action(guild, member, action):
         return
 
     settings = get_settings(guild.id)
-
     actions = settings.setdefault("actions", {})
-
     user_id = str(member.id)
 
     if user_id not in actions:
@@ -199,8 +195,6 @@ async def record_action(guild, member, action):
 
     actions[user_id][action].append(now)
 
-    save_antinuke(antinuke_data)
-
     limit = ANTI_NUKE_LIMITS.get(action, 999)
 
     if len(actions[user_id][action]) >= limit:
@@ -211,35 +205,8 @@ async def record_action(guild, member, action):
         )
 
         actions[user_id][action] = []
-        save_antinuke(antinuke_data)
 
-
-# =========================
-# TÌM NGƯỜI THỰC HIỆN
-# =========================
-
-async def find_audit_actor(guild, action_type, target_id=None):
-    try:
-        async for entry in guild.audit_logs(
-            limit=10,
-            action=action_type
-        ):
-            if abs(
-                datetime.now(datetime.utcnow().astimezone().tzinfo)
-                - entry.created_at
-            ).total_seconds() > 10:
-                continue
-
-            if target_id is not None:
-                if getattr(entry.target, "id", None) != target_id:
-                    continue
-
-            return entry.user
-
-    except Exception as e:
-        print("Audit log error:", e)
-
-    return None
+    save_antinuke(antinuke_data)
 
 
 # =========================
@@ -249,6 +216,9 @@ async def find_audit_actor(guild, action_type, target_id=None):
 @bot.event
 async def on_audit_log_entry_create(entry):
     guild = entry.guild
+
+    if guild is None:
+        return
 
     settings = get_settings(guild.id)
 
@@ -260,39 +230,30 @@ async def on_audit_log_entry_create(entry):
     if actor is None:
         return
 
+    # Không xử lý Owner/Admin
     if actor.id == guild.owner_id:
         return
 
     if actor.guild_permissions.administrator:
         return
 
-    action = entry.action
-
     action_map = {
         discord.AuditLogAction.channel_delete: "channel_delete",
         discord.AuditLogAction.channel_create: "channel_create",
-
         discord.AuditLogAction.role_delete: "role_delete",
         discord.AuditLogAction.role_create: "role_create",
-
         discord.AuditLogAction.ban: "ban",
         discord.AuditLogAction.kick: "kick",
-
         discord.AuditLogAction.webhook_create: "webhook_create",
-
         discord.AuditLogAction.bot_add: "bot_add",
     }
 
-    action_name = action_map.get(action)
+    action_name = action_map.get(entry.action)
 
     if not action_name:
         return
 
-    await record_action(
-        guild,
-        actor,
-        action_name
-    )
+    await record_action(guild, actor, action_name)
 
 
 # =========================
@@ -305,14 +266,12 @@ raid_joins = defaultdict(deque)
 @bot.event
 async def on_member_join(member):
     guild = member.guild
-
     settings = get_settings(guild.id)
 
     if not settings.get("antiraid"):
         return
 
     now = time.time()
-
     joins = raid_joins[guild.id]
 
     joins.append(now)
@@ -322,7 +281,6 @@ async def on_member_join(member):
 
     # 8 người vào trong 10 giây
     if len(joins) >= 8:
-
         try:
             await member.timeout(
                 timedelta(minutes=10),
@@ -355,7 +313,6 @@ async def on_member_join(member):
 @bot.command()
 @admin_only()
 async def antinuke(ctx, mode=None):
-
     settings = get_settings(ctx.guild.id)
 
     if mode is None:
@@ -370,7 +327,6 @@ async def antinuke(ctx, mode=None):
     mode = mode.lower()
 
     if mode == "on":
-
         settings["antinuke"] = True
         save_antinuke(antinuke_data)
 
@@ -380,21 +336,14 @@ async def antinuke(ctx, mode=None):
         )
 
     elif mode == "off":
-
         settings["antinuke"] = False
         save_antinuke(antinuke_data)
 
-        await ctx.send(
-            "🔓 **Anti-Nuke đã tắt.**"
-        )
+        await ctx.send("🔓 **Anti-Nuke đã tắt.**")
 
     elif mode == "status":
-
         status = "🟢 BẬT" if settings.get("antinuke") else "🔴 TẮT"
-
-        await ctx.send(
-            f"🛡️ **Anti-Nuke:** {status}"
-        )
+        await ctx.send(f"🛡️ **Anti-Nuke:** {status}")
 
     else:
         await ctx.send(
@@ -412,7 +361,6 @@ async def antinuke(ctx, mode=None):
 @bot.command()
 @admin_only()
 async def antiraid(ctx, mode=None):
-
     settings = get_settings(ctx.guild.id)
 
     if mode is None:
@@ -426,7 +374,6 @@ async def antiraid(ctx, mode=None):
     mode = mode.lower()
 
     if mode == "on":
-
         settings["antiraid"] = True
         save_antinuke(antinuke_data)
 
@@ -436,17 +383,14 @@ async def antiraid(ctx, mode=None):
         )
 
     elif mode == "off":
-
         settings["antiraid"] = False
         save_antinuke(antinuke_data)
 
-        await ctx.send(
-            "🔓 **Anti-Raid đã tắt.**"
-        )
+        await ctx.send("🔓 **Anti-Raid đã tắt.**")
 
     else:
         await ctx.send(
-            "`!antiraid on` hoặc `!antiraid off`"
+            "❌ Dùng: `!antiraid on` hoặc `!antiraid off`"
         )
 
 
@@ -457,7 +401,6 @@ async def antiraid(ctx, mode=None):
 @bot.command()
 @admin_only()
 async def antihigh(ctx):
-
     settings = get_settings(ctx.guild.id)
 
     settings["antinuke"] = True
@@ -480,7 +423,6 @@ async def antihigh(ctx):
 @bot.command()
 @admin_only()
 async def antilog(ctx):
-
     settings = get_settings(ctx.guild.id)
 
     settings["log_channel"] = ctx.channel.id
@@ -494,33 +436,100 @@ async def antilog(ctx):
 
 
 # =========================
+# !HELP
+# =========================
+
+@bot.command(name="help", aliases=["commands", "cmd"])
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="📚 MENU LỆNH BOT",
+        description=(
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "✨ **Danh sách lệnh bot**\n"
+            "━━━━━━━━━━━━━━━━━━━━"
+        ),
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="🛡️ ┃ ANTI SERVER / BẢO VỆ",
+        value=(
+            "`!antinuke on` → Bật chống Nuke\n"
+            "`!antinuke off` → Tắt chống Nuke\n"
+            "`!antinuke status` → Kiểm tra Anti-Nuke\n"
+            "`!antiraid on` → Bật chống Raid\n"
+            "`!antiraid off` → Tắt chống Raid\n"
+            "`!antihigh` → Bật Anti-Nuke + Anti-Raid\n"
+            "`!antilog` → Chọn kênh hiện tại làm kênh log"
+        ),
+        inline=False
+    )
+
+    settings = get_settings(ctx.guild.id)
+    anti = "🟢 BẬT" if settings.get("antinuke") else "🔴 TẮT"
+    raid = "🟢 BẬT" if settings.get("antiraid") else "🔴 TẮT"
+
+    log_channel = None
+    if settings.get("log_channel"):
+        log_channel = ctx.guild.get_channel(settings["log_channel"])
+
+    log_text = log_channel.mention if log_channel else "Chưa đặt"
+
+    embed.add_field(
+        name="📊 ┃ TRẠNG THÁI SERVER",
+        value=(
+            f"🛡️ Anti-Nuke: **{anti}**\n"
+            f"🚨 Anti-Raid: **{raid}**\n"
+            f"📋 Kênh log: {log_text}"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text="Các lệnh Anti chỉ Admin mới sử dụng được."
+    )
+
+    await ctx.send(embed=embed)
+
+
+# =========================
+# XỬ LÝ LỖI COMMAND
+# =========================
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        return
+
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ Bạn đang thiếu tham số cho lệnh này.")
+        return
+
+    print("Command error:", repr(error))
+
+
+# =========================
 # READY
 # =========================
 
 @bot.event
 async def on_ready():
-
-    print(
-        f"✅ Bot đã đăng nhập: "
-        f"{bot.user} | ID: {bot.user.id}"
-    )
-
-    print(
-        f"🛡️ Anti-Nuke System: READY"
-    )
-
-    print(
-        f"🚨 Anti-Raid System: READY"
-    )
+    print(f"✅ Bot đã đăng nhập: {bot.user} | ID: {bot.user.id}")
+    print("🛡️ Anti-Nuke System: READY")
+    print("🚨 Anti-Raid System: READY")
 
 
 # =========================
-# CHẠY BOT
+# RENDER HEALTH SERVER
 # =========================
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"Bot is online!")
 
@@ -547,6 +556,10 @@ if os.getenv("PORT"):
     ).start()
 
 
+# =========================
+# TOKEN
+# =========================
+
 token = os.getenv("DISCORD_TOKEN")
 
 if not token:
@@ -555,5 +568,4 @@ if not token:
     )
 
 bot.run(token)
-```
 
