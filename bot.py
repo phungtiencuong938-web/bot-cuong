@@ -1,3 +1,5 @@
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 import os
 import discord
 from discord.ext import commands
@@ -1162,4 +1164,40 @@ async def on_command_error(ctx, error):
 # =========================
 # 🚀 CHẠY BOT
 # =========================
-bot.run(os.getenv("DISCORD_TOKEN"))
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is online!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
+    print(f"Web server running on port {port}")
+    server.serve_forever()
+
+
+if os.getenv("PORT"):
+    threading.Thread(
+        target=start_server,
+        daemon=True
+    ).start()
+
+
+token = os.getenv("DISCORD_TOKEN")
+
+if not token:
+    raise RuntimeError(
+        "❌ Thiếu biến môi trường DISCORD_TOKEN"
+    )
+
+bot.run(token)
