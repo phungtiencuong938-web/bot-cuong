@@ -1,3 +1,4 @@
+from collections import defaultdict, deque
 import json
 import random as random_module
 import asyncio
