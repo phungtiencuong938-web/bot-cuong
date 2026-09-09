@@ -1,9 +1,8 @@
-
 import os
 import json
 import time
 import threading
-import atexit
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict, deque
 import random as random_module
@@ -16,40 +15,77 @@ from datetime import datetime, timedelta
 from discord.ext import commands
 
 # =========================================================
-# 🔒 CHỐNG CHẠY 2 BOT TRÊN CÙNG MỘT MÁY
+# ⚙️ CẤU HÌNH
 # =========================================================
-INSTANCE_LOCK_FILE = "bot_instance.lock"
+
+# =========================================================
+# 🔒 CHỐNG CHẠY 2 PHIÊN BẢN BOT TRÊN CÙNG MÁY
+# =========================================================
+INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_instance.lock")
+
+def _pid_is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 def acquire_instance_lock():
     try:
-        # Tạo file độc quyền; nếu file đã tồn tại thì một phiên bản khác
-        # của bot trên cùng máy đang chạy.
-        fd = os.open(
-            INSTANCE_LOCK_FILE,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        )
-        os.write(fd, str(os.getpid()).encode("utf-8"))
-        os.close(fd)
+        # Tạo file độc quyền. Nếu đã tồn tại, kiểm tra PID cũ.
+        fd = os.open(INSTANCE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        print(f"🔒 Instance lock OK | PID={os.getpid()}", flush=True)
         return True
     except FileExistsError:
-        print("❌ BOT ĐÃ ĐƯỢC CHẠY Ở MỘT PHIÊN BẢN KHÁC TRÊN MÁY NÀY.")
-        print("➡️ Nếu chắc chắn bot không còn chạy, hãy xóa file bot_instance.lock rồi chạy lại.")
-        return False
+        try:
+            old_pid = int(Path(INSTANCE_LOCK_FILE).read_text(encoding="utf-8").strip())
+        except Exception:
+            old_pid = None
+
+        if old_pid and _pid_is_running(old_pid):
+            print(f"❌ BOT ĐANG CHẠY Ở MỘT PHIÊN BẢN KHÁC | PID={old_pid}", flush=True)
+            print("➡️ Hãy đóng phiên bản bot còn lại rồi chạy lại.", flush=True)
+            return False
+
+        # Lock cũ của process đã chết -> dọn và thử lại.
+        try:
+            os.remove(INSTANCE_LOCK_FILE)
+        except FileNotFoundError:
+            pass
+        try:
+            fd = os.open(INSTANCE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            print(f"🔒 Đã dọn lock cũ và tạo lock mới | PID={os.getpid()}", flush=True)
+            return True
+        except FileExistsError:
+            print("❌ Không thể tạo instance lock vì một phiên bản khác vừa khởi động.", flush=True)
+            return False
 
 def release_instance_lock():
     try:
-        os.remove(INSTANCE_LOCK_FILE)
-    except FileNotFoundError:
-        pass
+        if Path(INSTANCE_LOCK_FILE).exists():
+            try:
+                pid = int(Path(INSTANCE_LOCK_FILE).read_text(encoding="utf-8").strip())
+            except Exception:
+                pid = None
+            if pid == os.getpid():
+                os.remove(INSTANCE_LOCK_FILE)
+                print("🔓 Đã giải phóng instance lock.", flush=True)
+    except Exception as e:
+        print(f"⚠️ Không thể giải phóng instance lock: {e!r}", flush=True)
 
 if not acquire_instance_lock():
     raise SystemExit(1)
 
+import atexit
 atexit.register(release_instance_lock)
-
-# =========================================================
-# ⚙️ CẤU HÌNH
-# =========================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -122,9 +158,23 @@ async def global_check(ctx):
 # =========================================================
 
 @bot.event
+async def on_disconnect():
+    print("⚠️ Discord Gateway đã ngắt kết nối. discord.py sẽ tự động reconnect...", flush=True)
+
+@bot.event
+async def on_resumed():
+    print("✅ Discord Gateway đã kết nối lại (RESUMED).", flush=True)
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    print(f"❌ Lỗi trong Discord event: {event}", flush=True)
+    traceback.print_exc()
+
+@bot.event
 async def on_ready():
     print("=" * 55)
-    print(f"🤖 Bot đã đăng nhập: {bot.user}")
+    print(f"🤖 Bot đã đăng nhập: {bot.user}", flush=True)
+    print(f"💓 Gateway latency: {bot.latency * 1000:.0f}ms", flush=True)
     print(f"🆔 ID: {bot.user.id}")
     print(f"🌐 Server: {len(bot.guilds)}")
     print(f"📚 Commands: {len(bot.commands)}")
@@ -1673,7 +1723,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot is online!")
+        self.wfile.write(b"Bot is running - Discord reconnect enabled")
 
     def log_message(self, format, *args):
         pass
@@ -1681,7 +1731,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def start_server():
     port = int(os.getenv("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"Web server running on port {port}")
+    print(f"🌐 Web server running on port {port}", flush=True)
     server.serve_forever()
 
 if os.getenv("PORT"):
@@ -1691,4 +1741,17 @@ token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("❌ Thiếu biến môi trường DISCORD_TOKEN")
 
-bot.run(token)
+while True:
+    try:
+        print("🚀 Đang khởi động Discord bot...", flush=True)
+        bot.run(token, reconnect=True)
+        print("⚠️ bot.run() đã kết thúc.", flush=True)
+        break
+    except KeyboardInterrupt:
+        print("🛑 Bot được dừng thủ công.", flush=True)
+        break
+    except Exception as e:
+        print(f"❌ Bot gặp lỗi nghiêm trọng: {e!r}", flush=True)
+        traceback.print_exc()
+        print("🔄 Sẽ thử khởi động lại sau 10 giây...", flush=True)
+        time.sleep(10)
