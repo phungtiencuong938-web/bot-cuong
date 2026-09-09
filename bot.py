@@ -1,10 +1,12 @@
+
 import os
 import json
 import time
 import threading
-import traceback
+import atexit
+import shutil
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import defaultdict, deque
 import random as random_module
 import asyncio
@@ -16,127 +18,93 @@ from datetime import datetime, timedelta
 from discord.ext import commands
 
 # =========================================================
-# ⚙️ CẤU HÌNH
+# 🚀 RENDER / PATH / PERSISTENT STORAGE
 # =========================================================
+BASE_DIR = Path(__file__).resolve().parent
+# DATA_DIR có thể trỏ tới Persistent Disk của Render (ví dụ /var/data).
+# Nếu không có, dùng thư mục ./data cạnh bot.py.
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# =========================================================
-# 🔒 CHỐNG CHẠY 2 PHIÊN BẢN BOT TRÊN CÙNG MÁY
-# =========================================================
-INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_instance.lock")
-
-def _pid_is_running(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+INSTANCE_LOCK_FILE = DATA_DIR / "bot_instance.lock"
 
 def acquire_instance_lock():
     try:
-        # Tạo file độc quyền. Nếu đã tồn tại, kiểm tra PID cũ.
-        fd = os.open(INSTANCE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(str(INSTANCE_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
-        print(f"🔒 Instance lock OK | PID={os.getpid()}", flush=True)
         return True
     except FileExistsError:
         try:
-            old_pid = int(Path(INSTANCE_LOCK_FILE).read_text(encoding="utf-8").strip())
-        except Exception:
-            old_pid = None
-
-        if old_pid and _pid_is_running(old_pid):
-            print(f"❌ BOT ĐANG CHẠY Ở MỘT PHIÊN BẢN KHÁC | PID={old_pid}", flush=True)
-            print("➡️ Hãy đóng phiên bản bot còn lại rồi chạy lại.", flush=True)
+            pid = int(INSTANCE_LOCK_FILE.read_text(encoding="utf-8").strip())
+            # Linux/Render: kiểm tra PID cũ còn tồn tại không.
+            os.kill(pid, 0)
+            print(f"❌ Bot đã chạy (PID {pid}).")
             return False
-
-        # Lock cũ của process đã chết -> dọn và thử lại.
-        try:
-            os.remove(INSTANCE_LOCK_FILE)
-        except FileNotFoundError:
-            pass
-        try:
-            fd = os.open(INSTANCE_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
-            print(f"🔒 Đã dọn lock cũ và tạo lock mới | PID={os.getpid()}", flush=True)
-            return True
-        except FileExistsError:
-            print("❌ Không thể tạo instance lock vì một phiên bản khác vừa khởi động.", flush=True)
-            return False
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            try:
+                INSTANCE_LOCK_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return acquire_instance_lock()
 
 def release_instance_lock():
     try:
-        if Path(INSTANCE_LOCK_FILE).exists():
-            try:
-                pid = int(Path(INSTANCE_LOCK_FILE).read_text(encoding="utf-8").strip())
-            except Exception:
-                pid = None
-            if pid == os.getpid():
-                os.remove(INSTANCE_LOCK_FILE)
-                print("🔓 Đã giải phóng instance lock.", flush=True)
-    except Exception as e:
-        print(f"⚠️ Không thể giải phóng instance lock: {e!r}", flush=True)
+        INSTANCE_LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 if not acquire_instance_lock():
     raise SystemExit(1)
-
-import atexit
 atexit.register(release_instance_lock)
 
+# =========================================================
+# ⚙️ CẤU HÌNH
+# =========================================================
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None
-)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-CONFIG_FILE = "config.json"
-ECONOMY_FILE = "economy.json"
-TEAM_FILE = "teams.json"
-
+CONFIG_FILE = DATA_DIR / "config.json"
+ECONOMY_FILE = DATA_DIR / "economy.json"
+TEAM_FILE = DATA_DIR / "teams.json"
+ANTI_NUKE_FILE = DATA_DIR / "antinuke.json"
 HELP_GIF = "https://media.giphy.com/media/26BRuo6sLetdllPAQ/giphy.gif"
 
 # =========================================================
-# 💾 DATABASE
+# 💾 DATABASE AN TOÀN / ATOMIC SAVE
 # =========================================================
-
 def load_json(filename, default):
+    path = Path(filename)
     try:
-        with open(filename, "r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
 
 def save_json(filename, data):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    path = Path(filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[DB ERROR] Không lưu được {path}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 config = load_json(CONFIG_FILE, {})
 economy = load_json(ECONOMY_FILE, {})
 teams = load_json(TEAM_FILE, {})
-
-def get_user(user_id):
-    uid = str(user_id)
-    if uid not in economy:
-        economy[uid] = {
-            "money": 1000,
-            "bank": 0,
-            "level": 1,
-            "xp": 0,
-            "hp": 100,
-            "wins": 0,
-            "losses": 0
-        }
-        save_json(ECONOMY_FILE, economy)
-    return economy[uid]
 
 # =========================================================
 # 🔒 KÊNH BOT
@@ -154,28 +122,22 @@ def check_channel(ctx):
 async def global_check(ctx):
     return check_channel(ctx)
 
+@bot.event
+async def on_disconnect():
+    print("⚠️ Discord Gateway mất kết nối. Đang tự reconnect...")
+
+@bot.event
+async def on_resumed():
+    print("✅ Discord Gateway đã resume/reconnect thành công.")
+
 # =========================================================
 # 🚀 READY
 # =========================================================
 
 @bot.event
-async def on_disconnect():
-    print("⚠️ Discord Gateway đã ngắt kết nối. discord.py sẽ tự động reconnect...", flush=True)
-
-@bot.event
-async def on_resumed():
-    print("✅ Discord Gateway đã kết nối lại (RESUMED).", flush=True)
-
-@bot.event
-async def on_error(event, *args, **kwargs):
-    print(f"❌ Lỗi trong Discord event: {event}", flush=True)
-    traceback.print_exc()
-
-@bot.event
 async def on_ready():
     print("=" * 55)
-    print(f"🤖 Bot đã đăng nhập: {bot.user}", flush=True)
-    print(f"💓 Gateway latency: {bot.latency * 1000:.0f}ms", flush=True)
+    print(f"🤖 Bot đã đăng nhập: {bot.user}")
     print(f"🆔 ID: {bot.user.id}")
     print(f"🌐 Server: {len(bot.guilds)}")
     print(f"📚 Commands: {len(bot.commands)}")
@@ -1411,7 +1373,7 @@ async def batngo(ctx):
 # 🛡️ ANTI SERVER - CHỈ CHỦ SERVER
 # =========================================================
 
-ANTI_NUKE_FILE = "antinuke.json"
+ANTI_NUKE_FILE = DATA_DIR / "antinuke.json"
 
 def load_antinuke():
     try:
@@ -1718,42 +1680,53 @@ async def on_command_error(ctx, error):
 # =========================================================
 # 🌐 RENDER HEALTH SERVER + CHẠY BOT
 # =========================================================
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path not in ("/", "/health", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = b"OK"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"Bot is running - Discord reconnect enabled")
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass
+        return
 
 def start_server():
     port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"🌐 Web server running on port {port}", flush=True)
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    server.daemon_threads = True
+    print(f"🌐 Render health server: 0.0.0.0:{port}")
     server.serve_forever()
 
-if os.getenv("PORT"):
-    threading.Thread(target=start_server, daemon=True).start()
+threading.Thread(target=start_server, name="render-health", daemon=True).start()
 
-token = os.getenv("DISCORD_TOKEN")
-if not token:
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+if not TOKEN:
     raise RuntimeError("❌ Thiếu biến môi trường DISCORD_TOKEN")
 
-while True:
-    try:
-        print("🚀 Đang khởi động Discord bot...", flush=True)
-        bot.run(token, reconnect=True)
-        print("⚠️ bot.run() đã kết thúc.", flush=True)
-        break
-    except KeyboardInterrupt:
-        print("🛑 Bot được dừng thủ công.", flush=True)
-        break
-    except Exception as e:
-        print(f"❌ Bot gặp lỗi nghiêm trọng: {e!r}", flush=True)
-        traceback.print_exc()
-        print("🔄 Sẽ thử khởi động lại sau 10 giây...", flush=True)
-        time.sleep(10)
+# Discord.py tự xử lý reconnect Gateway khi reconnect=True.
+# loop bên ngoài giúp process tiếp tục thử lại nếu run() kết thúc do lỗi mạng/tạm thời.
+def run_bot_forever():
+    delay = 5
+    while True:
+        try:
+            print("🚀 Đang khởi động Discord bot...")
+            bot.run(TOKEN, reconnect=True, log_handler=None)
+            print("⚠️ Discord bot đã dừng. Sẽ thử kết nối lại...")
+            delay = 5
+        except KeyboardInterrupt:
+            print("🛑 Bot dừng theo yêu cầu.")
+            break
+        except Exception as exc:
+            print(f"💥 Bot crash/network error: {type(exc).__name__}: {exc}")
+            print(f"🔁 Reconnect sau {delay} giây...")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+run_bot_forever()
 
