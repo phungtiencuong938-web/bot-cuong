@@ -2,6 +2,7 @@ import os
 import json
 import time
 import threading
+import atexit
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict, deque
 import random as random_module
@@ -12,6 +13,38 @@ import requests
 
 from datetime import datetime, timedelta
 from discord.ext import commands
+
+# =========================================================
+# 🔒 CHỐNG CHẠY 2 BOT TRÊN CÙNG MỘT MÁY
+# =========================================================
+INSTANCE_LOCK_FILE = "bot_instance.lock"
+
+def acquire_instance_lock():
+    try:
+        # Tạo file độc quyền; nếu file đã tồn tại thì một phiên bản khác
+        # của bot trên cùng máy đang chạy.
+        fd = os.open(
+            INSTANCE_LOCK_FILE,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        )
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        print("❌ BOT ĐÃ ĐƯỢC CHẠY Ở MỘT PHIÊN BẢN KHÁC TRÊN MÁY NÀY.")
+        print("➡️ Nếu chắc chắn bot không còn chạy, hãy xóa file bot_instance.lock rồi chạy lại.")
+        return False
+
+def release_instance_lock():
+    try:
+        os.remove(INSTANCE_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+
+if not acquire_instance_lock():
+    raise SystemExit(1)
+
+atexit.register(release_instance_lock)
 
 # =========================================================
 # ⚙️ CẤU HÌNH
