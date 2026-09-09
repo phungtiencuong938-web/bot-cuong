@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -1103,7 +1104,7 @@ async def daily(ctx):
 async def work(ctx):
     u = get_user(ctx.author.id)
     reward = random_module.randint(100, 700)
-    job = random_module.choice(["👨‍💻 Lập trình viên", "🍔 Bán đồ ăn", "🚚 Shipper", "🎮 Streamer"])
+    job = random_module.choice(["👨💻 Lập trình viên", "🍔 Bán đồ ăn", "🚚 Shipper", "🎮 Streamer"])
     u["money"] += reward
     save_json(ECONOMY_FILE, economy)
     await ctx.send(f"💼 {job}\n💰 +**{reward:,} coins**")
